@@ -43,12 +43,12 @@ const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
 
 (async () => {
   try {
-    console.log('Registering slash commands...');
+    console.log('Registering global slash commands...');
     await rest.put(
-      Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
+      Routes.applicationCommands(process.env.CLIENT_ID),
       { body: commands }
     );
-    console.log('✅ All commands registered successfully!');
+    console.log('✅ All commands registered globally! (may take up to 1 hour to appear in servers)');
   } catch (error) {
     console.error('Error:', error);
   }
