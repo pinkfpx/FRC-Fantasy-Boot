@@ -344,7 +344,8 @@ client.on('interactionCreate', async (interaction) => {
         const { player, totalScore } = playerScores[i];
         const teams = data.teamsDrafted[player] || [];
         const medal = medals[i] || `**${i + 1}.**`;
-        desc += `${medal} <@${player}> — **${totalScore} pts**\n`;
+        const avg = teams.length > 0 ? (totalScore / teams.length).toFixed(1) : "0.0";
+        desc += `${medal} <@${player}> — **${totalScore} pts** *(avg ${avg}/team)*\n`;
         if (teams.length > 0) {
           desc += `Teams: ${teams.map(t => `FRC ${t}`).join(', ')}\n`;
         } else {
