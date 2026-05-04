@@ -92,8 +92,21 @@ async function loadSeasonTeams() {
 }
 
 async function loadWorldsTeams() {
-  const teams = await safeFetch('https://www.thebluealliance.com/api/v3/event/2026cmptx/teams', TBA);
-  return teams?.map(t => t.team_number) || [];
+  const [events, allTeams] = await Promise.all([
+    safeFetch('https://www.thebluealliance.com/api/v3/events/2026', TBA),
+    loadSeasonTeams()
+  ]);
+  const worlds = (events || [])
+    .filter(e => e.event_type === 3 || e.event_type === 4)
+    .map(e => e.key);
+  if (!worlds.length) return [];
+
+  const teams = new Set();
+  for (const eventKey of worlds) {
+    const eventTeams = await safeFetch(`https://www.thebluealliance.com/api/v3/event/${eventKey}/teams`, TBA);
+    for (const team of eventTeams || []) teams.add(team.team_number);
+  }
+  return [...teams].filter(team => allTeams.includes(team));
 }
 
 // ---------------- DISPLAY HELPERS ----------------
