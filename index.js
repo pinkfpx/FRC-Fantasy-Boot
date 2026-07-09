@@ -665,25 +665,27 @@ client.on('interactionCreate', async (interaction) => {
       const scoreFn = data.phase === "worlds" || data.phase === "worlds_finished" ? getTeamWorldsScore : getTeamSeasonScore;
       const medals = ['🥇', '🥈', '🥉'];
 
-      const blocks = await Promise.all(data.players.map(async player => {
-        const teams = data.teamsDrafted[player] || [];
-        const scored = await Promise.all(teams.map(async t => ({ team: t, score: await scoreFn(t) })));
-        scored.sort((a, b) => b.score - a.score);
-        const top3 = scored.slice(0, 3);
+      const standings = await calcStandings(data, scoreFn);
+      const top3 = standings.slice(0, 3);
 
-        const draftPos = data.draftOrder.indexOf(player) + 1;
-        const posLabel = draftPos ? `Draft position: **#${draftPos}**` : "Draft position: unknown";
+      let desc = "**Top 3 Fantasy Players**\n\n";
+      for (let i = 0; i < top3.length; i++) {
+        const p = top3[i];
+        desc += `${medals[i]} ${playerDisplay(p.player)} — **${p.totalScore} pts**\n`;
+      }
 
-        const lines = await Promise.all(top3.map(async (s, i) => {
-          const name = await getTeamName(s.team);
-          return `${medals[i] || '⭐'} **${name}** — ${s.score} pts`;
-        }));
-
-        return `**${playerDisplay(player)}** (${posLabel})\n${lines.join('\n') || 'No teams drafted yet.'}`;
-      }));
+      const viewerRank = standings.findIndex(s => s.player === userId);
+      if (viewerRank >= 0) {
+        const place = viewerRank + 1;
+        const suffix = (place % 10 === 1 && place !== 11) ? 'st' : (place % 10 === 2 && place !== 12) ? 'nd' : (place % 10 === 3 && place !== 13) ? 'rd' : 'th';
+        const viewer = standings[viewerRank];
+        desc += `\n👤 **Your placement:** ${place}${suffix} place — **${viewer.totalScore} pts**`;
+      } else if (data.players.includes(BOT_PLAYER_ID) && userId !== BOT_PLAYER_ID) {
+        desc += "\n👤 You are not in this draft.";
+      }
 
       return interaction.editReply({ embeds: [
-        new EmbedBuilder().setTitle("🏆 Fantasy Podium — Top 3 Teams Per Player").setDescription(blocks.join('\n\n')).setColor(0xFFD700)
+        new EmbedBuilder().setTitle("🏆 Fantasy Podium").setDescription(desc).setColor(0xFFD700)
       ]});
     }
 
