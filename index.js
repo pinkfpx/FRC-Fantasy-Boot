@@ -61,9 +61,11 @@ function saveData(data, channelId) {
 // ---------------- GUILD CONFIG (per-server) ----------------
 function loadGuildConfig(guildId) {
   try {
-    return JSON.parse(fs.readFileSync(`./guild_config_${guildId}.json`));
+    const cfg = JSON.parse(fs.readFileSync(`./guild_config_${guildId}.json`));
+    if (!('predictionMessageId' in cfg)) cfg.predictionMessageId = null;
+    return cfg;
   } catch {
-    return { draftChannelId: null, announcementChannelId: null, lastPostedWeek: -1 };
+    return { draftChannelId: null, announcementChannelId: null, lastPostedWeek: -1, predictionMessageId: null };
   }
 }
 
@@ -276,7 +278,7 @@ async function getTeamEventBreakdown(teamNumber, year = DEFAULT_YEAR) {
     eventResults.push({
       eventKey: ev.key,
       eventName: ev.name,
-      week: ev.week ?? null,
+      week: resolveEventWeek(ev),
       startDate: ev.start_date,
       rawPoints: pts
     });
@@ -288,15 +290,27 @@ async function getTeamEventBreakdown(teamNumber, year = DEFAULT_YEAR) {
   return { events: eventResults, total, doubled };
 }
 
+// Resolve an event's week number. TBA assigns week numbers to most events, but some
+// international / midweek events (e.g. Turkey, Israel) may have week === null.
+// In that case we estimate the week from the event's start date relative to March 1
+// of the season year, which is approximately when FRC Week 0 begins.
+function resolveEventWeek(ev) {
+  if (ev.week != null) return ev.week;
+  const date = new Date(ev.start_date);
+  const seasonStart = new Date(Date.UTC(date.getUTCFullYear(), 2, 1)); // March 1
+  const daysDiff = (date - seasonStart) / (1000 * 60 * 60 * 24);
+  return Math.max(0, Math.floor(daysDiff / 7));
+}
+
 // Returns the last fully-completed FRC event week number (0-indexed) for the given year,
-// or -1 if none have completed yet.
+// or -1 if none have completed yet. Includes null-week events (midweek/international).
 async function getLastCompletedSeasonWeek(year) {
   const today = new Date();
   const events = await safeFetch(`https://www.thebluealliance.com/api/v3/events/${year}`, TBA);
   if (!events) return -1;
   const completed = events
-    .filter(e => (e.event_type === 0 || e.event_type === 1) && e.week != null && new Date(e.end_date) < today)
-    .map(e => e.week);
+    .filter(e => (e.event_type === 0 || e.event_type === 1) && new Date(e.end_date) < today)
+    .map(e => resolveEventWeek(e));
   return completed.length ? Math.max(...completed) : -1;
 }
 
@@ -394,7 +408,8 @@ async function postWeeklyStandings(guildId, weekNum, year) {
   saveGuildConfig(config, guildId);
 }
 
-// Called by the daily cron — posts standings for any newly completed FRC weeks.
+// Called by the 3-hour cron — posts standings for any newly completed FRC weeks.
+// Runs every 3 hours so midweek events (e.g. Turkey, Israel) are caught promptly.
 async function checkAndPostWeeklyUpdate() {
   const year = DEFAULT_YEAR;
   const lastWeek = await getLastCompletedSeasonWeek(year);
@@ -406,10 +421,154 @@ async function checkAndPostWeeklyUpdate() {
     const config = loadGuildConfig(guildId);
     if (lastWeek > config.lastPostedWeek) {
       for (let w = config.lastPostedWeek + 1; w <= lastWeek; w++) {
-        await postWeeklyStandings(guildId, w, year).catch(err =>
-          console.error(`Weekly standings error guild=${guildId} week=${w}:`, err)
-        );
+        await postWeeklyStandings(guildId, w, year).catch(async err => {
+          console.error(`Weekly standings error guild=${guildId} week=${w}:`, err);
+          await sendBotAlert(guildId, 'Weekly Standings Error',
+            `Failed to post Week ${w + 1} standings.\n\`\`\`${err.message}\`\`\``
+          ).catch(() => {});
+        });
       }
+    }
+  }
+}
+
+// ---------------- BOT ALERTS ----------------
+
+// Sends an error/alert embed to a single guild's announcements channel.
+async function sendBotAlert(guildId, title, description) {
+  try {
+    const config = loadGuildConfig(guildId);
+    if (!config.announcementChannelId) return;
+    const ch = await client.channels.fetch(config.announcementChannelId).catch(() => null);
+    if (!ch) return;
+    await ch.send({ embeds: [
+      new EmbedBuilder()
+        .setTitle(`⚠️ ${title}`)
+        .setDescription(String(description).slice(0, 2000))
+        .setColor(0xE74C3C)
+        .setTimestamp()
+    ]});
+  } catch {}
+}
+
+// Broadcasts an alert to every guild that has an announcements channel.
+async function broadcastBotAlert(title, description) {
+  const files = fs.readdirSync('./').filter(f => f.startsWith('guild_config_') && f.endsWith('.json'));
+  for (const file of files) {
+    const guildId = file.replace('guild_config_', '').replace('.json', '');
+    await sendBotAlert(guildId, title, description).catch(() => {});
+  }
+}
+
+// ---------------- STATBOTICS PREDICTIONS ----------------
+
+// Fetches team-event prediction data from Statbotics. Returns null on any failure.
+async function getStatboticsTeamEvent(teamNumber, eventKey) {
+  try {
+    const res = await fetch(
+      `https://api.statbotics.io/v3/team_event/${teamNumber}/${eventKey}`,
+      { headers: { Accept: 'application/json' } }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data || Object.keys(data).length === 0) return null;
+    return data;
+  } catch { return null; }
+}
+
+// Returns qualifying (type 0/1) events that are actively running right now.
+async function getActiveSeasonEvents(year) {
+  const today = new Date().toISOString().split('T')[0];
+  const events = await safeFetch(`https://www.thebluealliance.com/api/v3/events/${year}/simple`, TBA);
+  if (!events) return [];
+  return events.filter(e =>
+    (e.event_type === 0 || e.event_type === 1) &&
+    e.start_date <= today && e.end_date >= today
+  );
+}
+
+// Every 3 hours: for each guild with an active season draft, find drafted teams at live
+// events, fetch Statbotics predictions, then silently edit a pinned embed in the
+// announcements channel (or send a new one if the old message was deleted).
+async function checkAndPostPredictions() {
+  const year = DEFAULT_YEAR;
+  const activeEvents = await getActiveSeasonEvents(year);
+  if (!activeEvents.length) return; // nothing to do off-season / between events
+
+  const files = fs.readdirSync('./').filter(f => f.startsWith('guild_config_') && f.endsWith('.json'));
+
+  for (const file of files) {
+    const guildId = file.replace('guild_config_', '').replace('.json', '');
+    const config = loadGuildConfig(guildId);
+    if (!config.announcementChannelId || !config.draftChannelId) continue;
+
+    const data = loadData(config.draftChannelId);
+    if (!data.players.length || data.phase === 'none') continue;
+    if (data.phase === 'worlds' || data.phase === 'worlds_finished') continue;
+
+    const allDraftedTeams = [...new Set(Object.values(data.teamsDrafted).flat())];
+
+    // Build per-event prediction sections
+    const eventSections = [];
+    for (const ev of activeEvents) {
+      const eventTeams = await safeFetch(`https://www.thebluealliance.com/api/v3/event/${ev.key}/teams/simple`, TBA);
+      if (!eventTeams) continue;
+      const eventTeamNums = new Set(eventTeams.map(t => t.team_number));
+      const draftedHere = allDraftedTeams.filter(t => eventTeamNums.has(t));
+      if (!draftedHere.length) continue;
+
+      const teamLines = await Promise.all(draftedHere.map(async teamNum => {
+        const [sb, name] = await Promise.all([
+          getStatboticsTeamEvent(teamNum, ev.key),
+          getTeamName(teamNum)
+        ]);
+        const shortName = name.split(' (')[0];
+        if (!sb) return `**FRC ${teamNum}** — ${shortName}: *predictions unavailable*`;
+
+        const predWins = (sb.pred?.wins ?? sb.epa?.wins)?.toFixed(1) ?? '?';
+        const predRank = sb.pred?.rank ?? '?';
+        const captainFlag = typeof predRank === 'number' && predRank <= 8 ? ' 🏳️' : '';
+        return `**FRC ${teamNum}** — ${shortName}\n> Pred. Wins: **${predWins}** | Pred. Rank: **${predRank}**${captainFlag}`;
+      }));
+
+      const weekLabel = `Week ${resolveEventWeek(ev) + 1}`;
+      eventSections.push({ name: `📍 ${ev.name} (${weekLabel})`, value: teamLines.join('\n') });
+    }
+
+    if (!eventSections.length) continue;
+
+    const embed = new EmbedBuilder()
+      .setTitle('🔮 Live Event Predictions')
+      .setDescription(
+        'Statbotics EPA predictions for drafted teams at active events.\n' +
+        '🏳️ = predicted alliance captain (rank ≤ 8)'
+      )
+      .addFields(eventSections)
+      .setColor(0x9B59B6)
+      .setFooter({ text: 'Updated every 3 hours from statbotics.io' })
+      .setTimestamp();
+
+    try {
+      const annChannel = await client.channels.fetch(config.announcementChannelId).catch(() => null);
+      if (!annChannel) continue;
+
+      if (config.predictionMessageId) {
+        try {
+          const existing = await annChannel.messages.fetch(config.predictionMessageId);
+          await existing.edit({ embeds: [embed] });
+        } catch {
+          // Message was deleted — send fresh
+          const msg = await annChannel.send({ embeds: [embed] });
+          config.predictionMessageId = msg.id;
+          saveGuildConfig(config, guildId);
+        }
+      } else {
+        const msg = await annChannel.send({ embeds: [embed] });
+        config.predictionMessageId = msg.id;
+        saveGuildConfig(config, guildId);
+      }
+    } catch (err) {
+      console.error(`Prediction post error guild=${guildId}:`, err);
     }
   }
 }
@@ -500,13 +659,21 @@ async function doBotPick(data, channelId, channel, guildId) {
 // ---------------- GLOBAL ERROR SAFETY ----------------
 process.on('unhandledRejection', (err) => {
   console.error('Unhandled rejection (bot kept alive):', err);
+  // Broadcast to all guilds — fire-and-forget so we don't block the process
+  broadcastBotAlert('Unexpected Bot Error',
+    `An unhandled error occurred. Some commands may not respond.\n\`\`\`${String(err?.message || err).slice(0, 500)}\`\`\``
+  ).catch(() => {});
 });
 
 // ---------------- READY ----------------
 client.once('clientReady', () => {
   console.log(`Logged in as ${client.user.tag}`);
-  // Daily check at 06:00 UTC for newly completed FRC event weeks
-  cron.schedule('0 6 * * *', () => {
+
+  // Every 3 hours: update Statbotics prediction embed + catch any newly completed event weeks.
+  // Running every 3 hours (instead of daily) also ensures midweek events (e.g. Turkey, Israel)
+  // are picked up within hours of completion rather than waiting for the next morning.
+  cron.schedule('0 */3 * * *', () => {
+    checkAndPostPredictions().catch(err => console.error('Predictions cron error:', err));
     checkAndPostWeeklyUpdate().catch(err => console.error('Weekly update cron error:', err));
   });
 });
@@ -537,7 +704,9 @@ client.on('guildCreate', async (guild) => {
       '👋 **FRC Fantasy Bot has arrived!**\n\n' +
       'This channel will receive:\n' +
       '• 📋 Full draft rosters when a draft completes\n' +
-      '• 📅 Weekly standings as FRC event results come in\n\n' +
+      '• 📅 Weekly standings as FRC event results come in\n' +
+      '• 🔮 Live Statbotics predictions (updated every 3 hours during active events)\n' +
+      '• ⚠️ Bot error alerts\n\n' +
       'A server admin should run `/setchannel` in whichever channel you want to use for draft commands.'
     );
   } catch (err) {
@@ -1173,6 +1342,11 @@ client.on('interactionCreate', async (interaction) => {
     console.error(err);
     if (interaction.deferred) interaction.editReply("❌ An error occurred.").catch(() => {});
     else if (!interaction.replied) interaction.reply("❌ An error occurred.").catch(() => {});
+    // Send alert to the guild's announcements channel so the admin is notified
+    sendBotAlert(guildId,
+      `Command Error: \`/${interaction.commandName}\``,
+      `An error occurred while handling this command.\n\`\`\`${String(err?.message || err).slice(0, 800)}\`\`\``
+    ).catch(() => {});
   }
 });
 
