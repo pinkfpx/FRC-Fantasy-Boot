@@ -4,8 +4,11 @@ const {
   Client,
   GatewayIntentBits,
   EmbedBuilder,
-  AttachmentBuilder
+  AttachmentBuilder,
+  ChannelType,
+  PermissionFlagsBits
 } = require('discord.js');
+const cron = require('node-cron');
 
 const fs = require('fs');
 
@@ -53,6 +56,19 @@ function getYear(data) {
 
 function saveData(data, channelId) {
   fs.writeFileSync(`./data_${channelId}.json`, JSON.stringify(data, null, 2));
+}
+
+// ---------------- GUILD CONFIG (per-server) ----------------
+function loadGuildConfig(guildId) {
+  try {
+    return JSON.parse(fs.readFileSync(`./guild_config_${guildId}.json`));
+  } catch {
+    return { draftChannelId: null, announcementChannelId: null, lastPostedWeek: -1 };
+  }
+}
+
+function saveGuildConfig(config, guildId) {
+  fs.writeFileSync(`./guild_config_${guildId}.json`, JSON.stringify(config, null, 2));
 }
 
 // ---------------- TBA CACHE ----------------
@@ -237,6 +253,167 @@ async function calcStandings(data, scoreFn) {
   return results.sort((a, b) => b.totalScore - a.totalScore);
 }
 
+// Returns the first 2 qualifying (non-DCMP) events for a team with per-event points.
+// event_type 0 = Regional, 1 = District (both count); 2 = DCMP (excluded).
+async function getTeamEventBreakdown(teamNumber, year = DEFAULT_YEAR) {
+  const events = await safeFetch(
+    `https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/${year}`, TBA
+  );
+  if (!events?.length) return { events: [], total: 0, doubled: false };
+
+  const qualifying = events
+    .filter(e => e.event_type === 0 || e.event_type === 1)
+    .sort((a, b) => new Date(a.start_date) - new Date(b.start_date))
+    .slice(0, 2);
+
+  let rawTotal = 0, counted = 0;
+  const eventResults = [];
+  for (const ev of qualifying) {
+    const dp = await safeFetch(
+      `https://www.thebluealliance.com/api/v3/event/${ev.key}/district_points`, TBA
+    );
+    const pts = dp?.points?.[`frc${teamNumber}`]?.total ?? null;
+    eventResults.push({
+      eventKey: ev.key,
+      eventName: ev.name,
+      week: ev.week ?? null,
+      startDate: ev.start_date,
+      rawPoints: pts
+    });
+    if (pts != null) { rawTotal += pts; counted++; }
+  }
+
+  const doubled = counted === 1;
+  const total = doubled ? rawTotal * 2 : rawTotal;
+  return { events: eventResults, total, doubled };
+}
+
+// Returns the last fully-completed FRC event week number (0-indexed) for the given year,
+// or -1 if none have completed yet.
+async function getLastCompletedSeasonWeek(year) {
+  const today = new Date();
+  const events = await safeFetch(`https://www.thebluealliance.com/api/v3/events/${year}`, TBA);
+  if (!events) return -1;
+  const completed = events
+    .filter(e => (e.event_type === 0 || e.event_type === 1) && e.week != null && new Date(e.end_date) < today)
+    .map(e => e.week);
+  return completed.length ? Math.max(...completed) : -1;
+}
+
+// Posts full rosters to the guild's announcements channel after a draft finishes.
+async function postRosterAnnouncement(data, guildId) {
+  const config = loadGuildConfig(guildId);
+  if (!config.announcementChannelId) return;
+  try {
+    const annChannel = await client.channels.fetch(config.announcementChannelId).catch(() => null);
+    if (!annChannel) return;
+    const year = getYear(data);
+
+    const lines = await Promise.all(data.players.map(async player => {
+      const teams = data.teamsDrafted[player] || [];
+      const names = await Promise.all(teams.map(getTeamName));
+      return `**${playerDisplay(player)}**\n` +
+        (names.length ? names.map((n, i) => `• FRC ${teams[i]} — ${n}`).join('\n') : 'No teams drafted.');
+    }));
+
+    await annChannel.send({ embeds: [
+      new EmbedBuilder()
+        .setTitle(`🏁 ${year} Fantasy Draft Complete — Full Rosters`)
+        .setDescription(lines.join('\n\n'))
+        .setColor(0x00AE86)
+        .setFooter({ text: 'Weekly standings will be posted here as events conclude.' })
+    ]});
+  } catch (err) {
+    console.error('postRosterAnnouncement error:', err);
+  }
+}
+
+// Posts Week N standings to the guild's announcements channel.
+// weekNum is 0-indexed (TBA's week field); displayed as "Week N+1".
+async function postWeeklyStandings(guildId, weekNum, year) {
+  const config = loadGuildConfig(guildId);
+  if (!config.announcementChannelId || !config.draftChannelId) return;
+
+  const data = loadData(config.draftChannelId);
+  if (!data.players.length || data.phase === 'none') return;
+  if (data.phase === 'worlds' || data.phase === 'worlds_finished') return;
+
+  const annChannel = await client.channels.fetch(config.announcementChannelId).catch(() => null);
+  if (!annChannel) return;
+
+  const allTeams = [...new Set(Object.values(data.teamsDrafted).flat())];
+  const year_ = year || getYear(data);
+
+  // Fetch full event breakdown for every drafted team
+  const teamBreakdowns = await Promise.all(allTeams.map(async t => {
+    const bd = await getTeamEventBreakdown(t, year_);
+    const name = await getTeamName(t);
+    const weekEvents = bd.events.filter(e => e.week === weekNum && e.rawPoints != null);
+    const weekPts = weekEvents.reduce((s, e) => s + e.rawPoints, 0);
+    return { team: t, name, total: bd.total, doubled: bd.doubled, weekPts };
+  }));
+
+  // Week-specific results
+  const played = teamBreakdowns.filter(t => t.weekPts > 0).sort((a, b) => b.weekPts - a.weekPts);
+  const didntPlay = teamBreakdowns.filter(t => t.weekPts === 0);
+  let weekLine = '';
+  if (played.length) {
+    weekLine = played.map(t => `FRC ${t.team} — ${t.name.split(' (')[0]}: **${t.weekPts} pts**`).join('\n');
+    if (didntPlay.length) weekLine += '\n' + didntPlay.map(t => `FRC ${t.team}: *no event this week*`).join('\n');
+  } else {
+    weekLine = '*No drafted teams competed this week.*';
+  }
+
+  // Overall fantasy standings
+  const medals = ['🥇', '🥈', '🥉'];
+  const playerStandings = data.players.map(player => {
+    const teams = data.teamsDrafted[player] || [];
+    const total = teams.reduce((sum, team) => {
+      const bd = teamBreakdowns.find(t => t.team === team);
+      return sum + (bd?.total || 0);
+    }, 0);
+    return { player, total };
+  }).sort((a, b) => b.total - a.total);
+
+  const standingsLine = playerStandings
+    .map((p, i) => `${medals[i] || `${i + 1}.`} ${playerDisplay(p.player)} — **${p.total} pts**`)
+    .join('\n');
+
+  await annChannel.send({ embeds: [
+    new EmbedBuilder()
+      .setTitle(`📅 Week ${weekNum + 1} Standings`)
+      .addFields(
+        { name: `Week ${weekNum + 1} Event Results (drafted teams)`, value: weekLine || '*None*' },
+        { name: 'Overall Fantasy Standings', value: standingsLine || '*No data yet*' }
+      )
+      .setColor(0x5865F2)
+      .setFooter({ text: 'First 2 non-DCMP events only • Points doubled if only 1 event played' })
+  ]});
+
+  config.lastPostedWeek = weekNum;
+  saveGuildConfig(config, guildId);
+}
+
+// Called by the daily cron — posts standings for any newly completed FRC weeks.
+async function checkAndPostWeeklyUpdate() {
+  const year = DEFAULT_YEAR;
+  const lastWeek = await getLastCompletedSeasonWeek(year);
+  if (lastWeek < 0) return;
+
+  const files = fs.readdirSync('./').filter(f => f.startsWith('guild_config_') && f.endsWith('.json'));
+  for (const file of files) {
+    const guildId = file.replace('guild_config_', '').replace('.json', '');
+    const config = loadGuildConfig(guildId);
+    if (lastWeek > config.lastPostedWeek) {
+      for (let w = config.lastPostedWeek + 1; w <= lastWeek; w++) {
+        await postWeeklyStandings(guildId, w, year).catch(err =>
+          console.error(`Weekly standings error guild=${guildId} week=${w}:`, err)
+        );
+      }
+    }
+  }
+}
+
 // ---------------- DRAFT HELPERS ----------------
 function getCurrentPlayer(data) {
   const n = data.draftOrder.length;
@@ -278,7 +455,7 @@ async function buildFantasyBreakdown(data, scoreFn, player) {
 
 // ---------------- CPU AUTO-PICK ----------------
 // Called recursively until a human's turn or draft ends
-async function doBotPick(data, channelId, channel) {
+async function doBotPick(data, channelId, channel, guildId) {
   if (data.phase === "finished" || data.phase === "worlds_finished") return;
   if (getCurrentPlayer(data) !== BOT_PLAYER_ID) return;
 
@@ -305,6 +482,7 @@ async function doBotPick(data, channelId, channel) {
     data.phase = data.phase === "worlds" ? "worlds_finished" : "finished";
     saveData(data, channelId);
     await channel.send(`🤖 **CPU** picked **${name}**\n\n🏁 **Draft complete!** Run \`/standings\` to see the results!`);
+    if (data.phase === "finished" && guildId) postRosterAnnouncement(data, guildId).catch(() => {});
     return;
   }
 
@@ -315,7 +493,7 @@ async function doBotPick(data, channelId, channel) {
   // If it's still the bot's turn (consecutive picks in snake), keep going
   if (next === BOT_PLAYER_ID) {
     await new Promise(r => setTimeout(r, 1500)); // small delay so it doesn't feel instant
-    await doBotPick(data, channelId, channel);
+    await doBotPick(data, channelId, channel, guildId);
   }
 }
 
@@ -327,6 +505,44 @@ process.on('unhandledRejection', (err) => {
 // ---------------- READY ----------------
 client.once('clientReady', () => {
   console.log(`Logged in as ${client.user.tag}`);
+  // Daily check at 06:00 UTC for newly completed FRC event weeks
+  cron.schedule('0 6 * * *', () => {
+    checkAndPostWeeklyUpdate().catch(err => console.error('Weekly update cron error:', err));
+  });
+});
+
+// ---------------- GUILD JOIN — create announcements channel ----------------
+client.on('guildCreate', async (guild) => {
+  try {
+    const config = loadGuildConfig(guild.id);
+    if (config.announcementChannelId) return; // already set up
+
+    const channel = await guild.channels.create({
+      name: 'frc-fantasy-updates',
+      type: ChannelType.GuildText,
+      topic: 'FRC Fantasy Draft announcements and weekly standings — managed by the bot',
+      permissionOverwrites: [
+        {
+          id: guild.roles.everyone,
+          deny: [PermissionFlagsBits.SendMessages],
+          allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory]
+        }
+      ]
+    });
+
+    config.announcementChannelId = channel.id;
+    saveGuildConfig(config, guild.id);
+
+    await channel.send(
+      '👋 **FRC Fantasy Bot has arrived!**\n\n' +
+      'This channel will receive:\n' +
+      '• 📋 Full draft rosters when a draft completes\n' +
+      '• 📅 Weekly standings as FRC event results come in\n\n' +
+      'A server admin should run `/setchannel` in whichever channel you want to use for draft commands.'
+    );
+  } catch (err) {
+    console.error('guildCreate error:', err);
+  }
 });
 
 // ---------------- COMMAND HANDLER ----------------
@@ -336,10 +552,33 @@ client.on('interactionCreate', async (interaction) => {
 
   const guildId = interaction.guildId;
   const channelId = interaction.channelId;
-  const data = loadData(channelId);
   const userId = interaction.user.id;
 
+  // ── DRAFT CHANNEL GUARD ───────────────────────────────────────
+  const guildConfig = loadGuildConfig(guildId);
+  if (guildConfig.draftChannelId && channelId !== guildConfig.draftChannelId) {
+    return interaction.reply({
+      content: `❌ Draft commands must be used in <#${guildConfig.draftChannelId}>.`,
+      ephemeral: true
+    });
+  }
+
+  const data = loadData(channelId);
+
   try {
+
+    // ── SET CHANNEL ────────────────────────────────────────────────
+    if (interaction.commandName === 'setchannel') {
+      if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+        return interaction.reply({ content: "❌ You need **Manage Server** permission to set the draft channel.", ephemeral: true });
+      }
+      guildConfig.draftChannelId = channelId;
+      saveGuildConfig(guildConfig, guildId);
+      return interaction.reply(
+        `✅ **This channel is now the draft channel.**\nAll draft commands must be used here.\n` +
+        (guildConfig.announcementChannelId ? `Announcements will be posted in <#${guildConfig.announcementChannelId}>.` : '')
+      );
+    }
 
     // ── DRAFT STATUS ──────────────────────────────────────────────
     if (interaction.commandName === 'draftstatus') {
@@ -433,7 +672,7 @@ client.on('interactionCreate', async (interaction) => {
 
       // If CPU goes first, auto-pick immediately
       if (first === BOT_PLAYER_ID) {
-        await doBotPick(data, channelId, interaction.channel);
+        await doBotPick(data, channelId, interaction.channel, guildId);
       }
       return;
     }
@@ -468,7 +707,7 @@ client.on('interactionCreate', async (interaction) => {
       );
 
       if (getCurrentPlayer(data) === BOT_PLAYER_ID) {
-        await doBotPick(data, channelId, interaction.channel);
+        await doBotPick(data, channelId, interaction.channel, guildId);
       }
       return;
     }
@@ -498,6 +737,7 @@ client.on('interactionCreate', async (interaction) => {
       if (data.currentPick >= maxPicks) {
         data.phase = data.phase === "worlds" ? "worlds_finished" : "finished";
         saveData(data, channelId);
+        if (data.phase === "finished") postRosterAnnouncement(data, guildId).catch(() => {});
         return interaction.editReply(`✅ ${actor} picked **${name}**\n\n🏁 **Draft complete!** Run \`/standings\` to see the results!`);
       }
 
@@ -507,7 +747,7 @@ client.on('interactionCreate', async (interaction) => {
 
       // Trigger CPU auto-pick if it's now the bot's turn
       if (next === BOT_PLAYER_ID) {
-        await doBotPick(data, channelId, interaction.channel);
+        await doBotPick(data, channelId, interaction.channel, guildId);
       }
       return;
     }
@@ -538,6 +778,7 @@ client.on('interactionCreate', async (interaction) => {
       if (data.currentPick >= maxPicks) {
         data.phase = data.phase === "worlds" ? "worlds_finished" : "finished";
         saveData(data, channelId);
+        if (data.phase === "finished") postRosterAnnouncement(data, guildId).catch(() => {});
         return interaction.editReply(`✅ ${playerDisplay(current)} picked **${name}**\n\n🏁 **Draft complete!** Run \`/standings\` to see the results!`);
       }
 
@@ -546,7 +787,7 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.editReply(`✅ ${playerDisplay(current)} picked **${name}**\n\n👉 Next pick: ${playerDisplay(next)}`);
 
       if (next === BOT_PLAYER_ID) {
-        await doBotPick(data, channelId, interaction.channel);
+        await doBotPick(data, channelId, interaction.channel, guildId);
       }
       return;
     }
@@ -691,6 +932,7 @@ client.on('interactionCreate', async (interaction) => {
       if (data.currentPick >= maxPicks) {
         data.phase = data.phase === "worlds" ? "worlds_finished" : "finished";
         saveData(data, channelId);
+        if (data.phase === "finished") postRosterAnnouncement(data, guildId).catch(() => {});
         return interaction.editReply(`⚡ ${playerDisplay(current)} skipped and picked **${name}**\n\n🏁 **Draft complete!**`);
       }
 
@@ -699,7 +941,7 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.editReply(`⚡ ${playerDisplay(current)} skipped and picked **${name}**\n\n👉 Next pick: ${playerDisplay(next)}`);
 
       if (next === BOT_PLAYER_ID) {
-        await doBotPick(data, channelId, interaction.channel);
+        await doBotPick(data, channelId, interaction.channel, guildId);
       }
       return;
     }

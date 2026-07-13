@@ -2,6 +2,7 @@ require('dotenv').config();
 const { REST, Routes, SlashCommandBuilder } = require('discord.js');
 
 const fullCommands = [
+  new SlashCommandBuilder().setName('setchannel').setDescription('Set this channel as the draft channel (requires Manage Server permission)'),
   new SlashCommandBuilder().setName('currentyear').setDescription('Show the current year the bot is using for TBA data'),
   new SlashCommandBuilder()
     .setName('setyear')
@@ -87,6 +88,7 @@ const fullCommands = [
 ];
 
 const closedCommands = [
+  new SlashCommandBuilder().setName('setchannel').setDescription('Set this channel as the draft channel (requires Manage Server permission)'),
   new SlashCommandBuilder().setName('draftstatus').setDescription('Open or close + reset the draft'),
   new SlashCommandBuilder().setName('standings').setDescription('Show live fantasy standings with real scores from TBA'),
   new SlashCommandBuilder()
