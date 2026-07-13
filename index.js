@@ -335,20 +335,32 @@ async function postRosterAnnouncement(data, guildId) {
     if (!annChannel) return;
     const year = getYear(data);
 
-    const lines = await Promise.all(data.players.map(async player => {
+    const fields = await Promise.all(data.players.map(async player => {
       const teams = data.teamsDrafted[player] || [];
       const names = await Promise.all(teams.map(getTeamName));
-      return `**${playerDisplay(player)}**\n` +
-        (names.length ? names.map((n, i) => `• FRC ${teams[i]} — ${n}`).join('\n') : 'No teams drafted.');
+      const value = names.length
+        ? names.map((n, i) => `• FRC ${teams[i]} — ${n.split(' (')[0]}`).join('\n')
+        : '*No teams drafted.*';
+      // Discord field values cap at 1024 chars — truncate if a roster is unusually large.
+      return {
+        name: playerDisplay(player).replace(/\*/g, ''),
+        value: value.length > 1024 ? value.slice(0, 1020) + '\n…' : value
+      };
     }));
 
-    await annChannel.send({ embeds: [
-      new EmbedBuilder()
-        .setTitle(`🏁 ${year} Fantasy Draft Complete — Full Rosters`)
-        .setDescription(lines.join('\n\n'))
-        .setColor(0x00AE86)
-        .setFooter({ text: 'Weekly standings will be posted here as events conclude.' })
-    ]});
+    // Discord embeds cap at 25 fields — if the league has more than 25 players, split into
+    // multiple messages (extremely unlikely, but handled gracefully).
+    for (let i = 0; i < fields.length; i += 25) {
+      const chunk = fields.slice(i, i + 25);
+      const isFirst = i === 0;
+      await annChannel.send({ embeds: [
+        new EmbedBuilder()
+          .setTitle(isFirst ? `🏁 ${year} Fantasy Draft Complete — Full Rosters` : `🏁 Full Rosters (continued)`)
+          .addFields(chunk)
+          .setColor(0x00AE86)
+          .setFooter({ text: isFirst ? 'Weekly standings will be posted here as events conclude.' : '' })
+      ]});
+    }
   } catch (err) {
     console.error('postRosterAnnouncement error:', err);
   }
@@ -405,12 +417,16 @@ async function postWeeklyStandings(guildId, weekNum, year) {
     .map((p, i) => `${medals[i] || `${i + 1}.`} ${playerDisplay(p.player)} — **${p.total} pts**`)
     .join('\n');
 
+  // Discord field values cap at 1024 chars — truncate each if necessary.
+  const weekLineSafe = weekLine.length > 1024 ? weekLine.slice(0, 1020) + '\n…' : weekLine;
+  const standingsSafe = standingsLine.length > 1024 ? standingsLine.slice(0, 1020) + '\n…' : standingsLine;
+
   await annChannel.send({ embeds: [
     new EmbedBuilder()
       .setTitle(`📅 Week ${weekNum + 1} Standings`)
       .addFields(
-        { name: `Week ${weekNum + 1} Event Results (drafted teams)`, value: weekLine || '*None*' },
-        { name: 'Overall Fantasy Standings', value: standingsLine || '*No data yet*' }
+        { name: `Week ${weekNum + 1} Event Results (drafted teams)`, value: weekLineSafe || '*None*' },
+        { name: 'Overall Fantasy Standings', value: standingsSafe || '*No data yet*' }
       )
       .setColor(0x5865F2)
       .setFooter({ text: 'First 2 non-DCMP events only • Points doubled if only 1 event played' })
@@ -544,18 +560,27 @@ async function checkAndPostPredictions() {
       }));
 
       const weekLabel = `Week ${resolveEventWeek(ev) + 1}`;
-      eventSections.push({ name: `📍 ${ev.name} (${weekLabel})`, value: teamLines.join('\n') });
+      // Discord field values are capped at 1024 characters — truncate if needed.
+      let fieldValue = teamLines.join('\n');
+      if (fieldValue.length > 1024) fieldValue = fieldValue.slice(0, 1020) + '\n…';
+      eventSections.push({ name: `📍 ${ev.name} (${weekLabel})`, value: fieldValue });
     }
 
     if (!eventSections.length) continue;
+
+    // Discord embeds cap at 25 fields — keep the first 25 if there are more active events.
+    const fields = eventSections.slice(0, 25);
+    const overflowNote = eventSections.length > 25
+      ? `\n⚠️ ${eventSections.length - 25} additional event(s) omitted (embed limit reached).`
+      : '';
 
     const embed = new EmbedBuilder()
       .setTitle('🔮 Live Event Predictions')
       .setDescription(
         'Statbotics EPA predictions for drafted teams at active events.\n' +
-        '🏳️ = predicted alliance captain (rank ≤ 8)'
+        '🏳️ = predicted alliance captain (rank ≤ 8)' + overflowNote
       )
-      .addFields(eventSections)
+      .addFields(fields)
       .setColor(0x9B59B6)
       .setFooter({ text: 'Updated every 3 hours from statbotics.io' })
       .setTimestamp();
