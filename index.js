@@ -2190,3 +2190,14 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 client.login(process.env.TOKEN);
+
+// Exported for local testing only (e.g. exercising the auto-pick scoring logic without
+// spinning up the full Discord client). Does not affect runtime behavior.
+module.exports = {
+  getTeamHistoricalSeasonScore,
+  getTeamWorldsScore,
+  pickWithRandomness,
+  loadSeasonTeams,
+  getTeamName,
+  DEFAULT_YEAR,
+};
