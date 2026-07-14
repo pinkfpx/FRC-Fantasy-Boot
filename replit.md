@@ -78,6 +78,13 @@ Auto-picks don't just chase the single top-scoring team — they use a historica
 6. When season is over, host runs `/start_worlds_draft` — auto-calculates final standings and sets worlds draft order
 7. Worlds draft proceeds the same way with `/pick`
 
+## Reliability: Startup Message-History Recovery
+`data_<channelId>.json` is already saved to disk after every pick/join/trade, before the bot announces it in Discord — so a normal crash mid-action shouldn't lose state. As an extra safety net, on every startup (`clientReady`) the bot also replays each guild's draft-channel message history (its own past announcements) and rebuilds draft state from that if the channel shows equal-or-greater progress than the on-disk file. This protects against the JSON file itself being lost, corrupted, or rolled back independent of Discord.
+- This is a best-effort heuristic parser (regex over the bot's own message text), not a full audit log — it covers joins, admin promotions, manual/CPU players, season/worlds draft starts, all 4 pick variants (`/pick`, `/manualpick`, `/skip`, timer auto-skip), `/undraft`, and completed trades.
+- It only looks back to the most recent "draft closed & reset" message (`/draftstatus open:false` or `/reset_draft`), since those already purge most of the channel's bot messages anyway.
+- If the scan can't find a reset boundary within ~1000 messages, it skips recovery entirely rather than risk overwriting good data with a partial rebuild.
+- Note: this only makes the bot resilient to *data* loss on restart. It does not keep the bot *online* — the process still needs to be running (e.g. via a workflow) to serve Discord at all.
+
 ## Dependencies
 
 - `discord.js` ^14.26.3 — Discord bot framework

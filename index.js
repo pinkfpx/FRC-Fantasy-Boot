@@ -563,6 +563,234 @@ async function broadcastBotAlert(title, description) {
   }
 }
 
+// ---------------- STARTUP RECOVERY (message-history reconciliation) ----------------
+// Best-effort safety net: on startup, replay each guild's draft-channel message history
+// to reconstruct draft state, and use it whenever the channel shows at least as much
+// progress as the on-disk data file. saveData() already writes to disk before every
+// announcement, so this doesn't replace that — it's a fallback for cases where the JSON
+// file itself is missing, corrupted, or rolled back even though the bot's own messages
+// are still sitting in Discord (which is effectively a second, durable copy of history).
+const RECOVERY_MESSAGE_PAGES = 10;  // up to 10 * 100 = 1000 messages scanned per channel
+const RECOVERY_PAGE_SIZE = 100;
+
+// Resolves a chunk of message text (e.g. "<@123> → <@456>", "👤 **Jerry**", "🤖 **CPU**")
+// down to the player id/key used internally (Discord id, `MANUAL_<name>`, or BOT_PLAYER_ID).
+function resolvePlayerIdentityFromText(text) {
+  if (!text) return null;
+  const parts = text.split('→').map(s => s.trim());
+  const target = parts[parts.length - 1];
+  if (/🤖/.test(target) || /\bCPU\b/.test(target)) return BOT_PLAYER_ID;
+  const manualMatch = target.match(/👤\s*\*\*(.+?)\*\*/);
+  if (manualMatch) return `MANUAL_${manualMatch[1]}`;
+  const mentionMatch = target.match(/<@(\d+)>/);
+  if (mentionMatch) return mentionMatch[1];
+  return null;
+}
+
+function extractTeamNumber(text) {
+  const m = text && text.match(/\(FRC (\d+)\)/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+function ensureRecoveredPlayer(state, id) {
+  if (!id) return;
+  if (!state.players.includes(id)) state.players.push(id);
+  if (!(id in state.teamsDrafted)) state.teamsDrafted[id] = [];
+}
+
+// Parses one of the bot's own past messages into a mutation against `state` (a
+// freshData()-shaped object being rebuilt from scratch). Returns 'reset' if the message
+// marks a draft close/reset, so the caller can discard everything accumulated so far.
+function applyRecoveredMessage(state, content) {
+  if (/^🛑 \*\*Draft has been CLOSED and RESET\*\*/.test(content) || /^🧹 Draft fully reset\.$/.test(content)) {
+    return 'reset';
+  }
+
+  let m;
+
+  if ((m = content.match(/^✅ <@(\d+)> has joined the draft!$/))) {
+    ensureRecoveredPlayer(state, m[1]);
+    if (!state.admins.length) state.admins.push(m[1]);
+    return;
+  }
+
+  if ((m = content.match(/^✅ (<@\d+>) has been promoted to \*\*admin\*\*\.$/))) {
+    const id = resolvePlayerIdentityFromText(m[1]);
+    if (id && !state.admins.includes(id)) state.admins.push(id);
+    return;
+  }
+
+  if ((m = content.match(/^👤 \*\*(.+?)\*\* has been added as a manual player!$/))) {
+    ensureRecoveredPlayer(state, `MANUAL_${m[1]}`);
+    return;
+  }
+
+  if (/^🤖 \*\*CPU player added to the draft!\*\*/.test(content)) {
+    ensureRecoveredPlayer(state, BOT_PLAYER_ID);
+    return;
+  }
+
+  if ((m = content.match(/^📅 Year set to \*\*(\d+)\*\*\./))) {
+    state.year = parseInt(m[1], 10);
+    return;
+  }
+
+  if (/^🚀 \*\*Season Draft Started!\*\*/.test(content)) {
+    state.phase = 'season';
+    state.currentPick = 0;
+    state.draftOrder = [];
+    state.teamsDrafted = Object.fromEntries(state.players.map(p => [p, []]));
+    state.draftOpen = false;
+    state.pendingTrade = null;
+    state._needsSeasonTeams = true;
+    return;
+  }
+
+  if (/^🌍 \*\*Worlds Draft Started!\*\*/.test(content)) {
+    state.phase = 'worlds';
+    state.currentPick = 0;
+    state.draftOrder = [];
+    state.teamsDrafted = Object.fromEntries(state.players.map(p => [p, []]));
+    state.draftOpen = false;
+    state.pendingTrade = null;
+    state._needsWorldsTeams = true;
+    return;
+  }
+
+  if ((m = content.match(/^⏪ Undrafted \*\*(.+?)\*\* \(was pick #(\d+) by (.+?)\)/))) {
+    const team = extractTeamNumber(m[1]);
+    const pickIndex = parseInt(m[2], 10) - 1;
+    if (team != null) {
+      const owner = findOwner(state, team);
+      if (owner) state.teamsDrafted[owner] = state.teamsDrafted[owner].filter(t => t !== team);
+      state.pickLog = state.pickLog.filter(p => p.pickIndex !== pickIndex);
+      state.currentPick = pickIndex;
+      if (state.phase === 'finished') state.phase = 'season';
+      if (state.phase === 'worlds_finished') state.phase = 'worlds';
+    }
+    return;
+  }
+
+  if ((m = content.match(/^✅ \*\*Trade accepted!\*\*\n<@(\d+)> receives \*\*(.+?)\*\*\n<@(\d+)> receives \*\*(.+?)\*\*/))) {
+    const fromId = m[1], toId = m[3];
+    const wantingTeam = extractTeamNumber(m[2]);
+    const offeringTeam = extractTeamNumber(m[4]);
+    if (wantingTeam != null && offeringTeam != null) {
+      state.teamsDrafted[fromId] = (state.teamsDrafted[fromId] || []).filter(t => t !== offeringTeam).concat(wantingTeam);
+      state.teamsDrafted[toId]   = (state.teamsDrafted[toId]   || []).filter(t => t !== wantingTeam).concat(offeringTeam);
+    }
+    return;
+  }
+
+  // Pick-type messages — 4 variants, all end in "picked **Team Name (FRC ####)**"
+  const pickMatch =
+    content.match(/^🤖 \*\*CPU\*\* picked \*\*(.+?)\*\*/) ||
+    content.match(/^⚡ (.+?) skipped and picked \*\*(.+?)\*\*/) ||
+    content.match(/^⏱️ \*\*Time's up!\*\* (.+?) was auto-skipped → picked \*\*(.+?)\*\*/) ||
+    content.match(/^✅ (.+?) picked \*\*(.+?)\*\*/);
+
+  if (pickMatch) {
+    let player, teamText;
+    if (pickMatch.length === 2) { // CPU variant has no leading identity group
+      player = BOT_PLAYER_ID;
+      teamText = pickMatch[1];
+    } else {
+      player = resolvePlayerIdentityFromText(pickMatch[1]);
+      teamText = pickMatch[2];
+    }
+    const team = extractTeamNumber(teamText);
+    if (player && team != null) {
+      ensureRecoveredPlayer(state, player);
+      if (!state.teamsDrafted[player].includes(team)) state.teamsDrafted[player].push(team);
+      const pickIndex = state.currentPick;
+      state.pickLog.push({ player, team, pickIndex });
+      state.currentPick++;
+      // Round 0 of a fresh phase: the order picks appear in IS the draft order.
+      if (state.draftOrder.length < state.players.length && !state.draftOrder.includes(player)) {
+        state.draftOrder.push(player);
+      }
+    }
+  }
+}
+
+// Fetches and replays a channel's bot message history (oldest → newest, since the last
+// reset) into a freshData()-shaped object. Returns null if nothing could be recovered, or
+// if the scan hit its page cap without finding a reset boundary — too risky to trust a
+// possibly-partial rebuild in that case, so we leave the on-disk data alone.
+async function rebuildDataFromChannelHistory(channelId) {
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  if (!channel) return null;
+
+  const collected = [];
+  let before;
+  let hitCap = true;
+  for (let page = 0; page < RECOVERY_MESSAGE_PAGES; page++) {
+    const batch = await channel.messages.fetch({ limit: RECOVERY_PAGE_SIZE, ...(before ? { before } : {}) }).catch(() => null);
+    if (!batch || !batch.size) { hitCap = false; break; }
+    const botMsgs = [...batch.values()].filter(m => m.author.id === client.user.id);
+    collected.push(...botMsgs);
+    before = batch.last()?.id;
+    if (botMsgs.some(m =>
+      /^🛑 \*\*Draft has been CLOSED and RESET\*\*/.test(m.content) || /^🧹 Draft fully reset\.$/.test(m.content)
+    )) { hitCap = false; break; }
+    if (batch.size < RECOVERY_PAGE_SIZE) { hitCap = false; break; }
+  }
+
+  if (hitCap) {
+    console.warn(`Recovery scan for channel ${channelId} hit the page cap without finding a reset boundary — skipping to avoid a partial rebuild.`);
+    return null;
+  }
+
+  collected.sort((a, b) => a.createdTimestamp - b.createdTimestamp); // oldest -> newest
+
+  let state = freshData();
+  for (const msg of collected) {
+    const result = applyRecoveredMessage(state, msg.content);
+    if (result === 'reset') state = freshData();
+  }
+
+  if (state._needsSeasonTeams) state.seasonTeams = await loadSeasonTeams(getYear(state));
+  if (state._needsWorldsTeams) state.worldsTeams = await loadWorldsTeams(getYear(state));
+  delete state._needsSeasonTeams;
+  delete state._needsWorldsTeams;
+
+  return state;
+}
+
+// Runs once at startup for every guild with a configured draft channel. Treats the
+// channel's own message history as at least as trustworthy as the on-disk file, and
+// overwrites the file whenever history shows equal-or-greater progress (or the on-disk
+// file looks empty/missing while history shows real activity).
+async function recoverAllGuildData() {
+  let files;
+  try {
+    files = fs.readdirSync('./').filter(f => f.startsWith('guild_config_') && f.endsWith('.json'));
+  } catch { return; }
+
+  for (const file of files) {
+    const guildId = file.replace('guild_config_', '').replace('.json', '');
+    const config = loadGuildConfig(guildId);
+    if (!config.draftChannelId) continue;
+
+    try {
+      const onDisk = loadData(config.draftChannelId);
+      const rebuilt = await rebuildDataFromChannelHistory(config.draftChannelId);
+      if (!rebuilt) continue;
+
+      const onDiskProgress = onDisk.pickLog?.length || 0;
+      const rebuiltProgress = rebuilt.pickLog?.length || 0;
+      const onDiskLooksEmpty = !onDisk.players.length && onDisk.phase === 'none';
+
+      if (rebuiltProgress >= onDiskProgress || (onDiskLooksEmpty && (rebuilt.players.length || rebuiltProgress))) {
+        saveData(rebuilt, config.draftChannelId);
+        console.log(`Startup recovery: rebuilt draft state for channel ${config.draftChannelId} from message history (${rebuiltProgress} picks, ${rebuilt.players.length} players).`);
+      }
+    } catch (err) {
+      console.error(`Startup recovery failed for guild ${guildId}:`, err);
+    }
+  }
+}
+
 // ---------------- STATBOTICS PREDICTIONS ----------------
 
 // Fetches team-event prediction data from Statbotics. Returns null on any failure.
@@ -857,6 +1085,10 @@ process.on('unhandledRejection', (err) => {
 // ---------------- READY ----------------
 client.once('clientReady', () => {
   console.log(`Logged in as ${client.user.tag}`);
+
+  // Startup safety net: reconstruct any guild's draft state from its channel's own
+  // message history if the on-disk data file is missing, stale, or was rolled back.
+  recoverAllGuildData().catch(err => console.error('Startup recovery error:', err));
 
   // Every 3 hours: update Statbotics prediction embed + catch any newly completed event weeks.
   // Running every 3 hours (instead of daily) also ensures midweek events (e.g. Turkey, Israel)
