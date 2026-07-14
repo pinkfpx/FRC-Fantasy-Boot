@@ -333,6 +333,7 @@ async function getTeamHistoricalSeasonScore(teamNumber, currentYear) {
 // distributed, and it naturally tightens or loosens as the pool of remaining teams changes
 // through the draft — no hardcoded score threshold to keep in sync with a given season/pool.
 function pickWithRandomness(scoredList, poolSize = 10, minRelativeStrength = 0.9) {
+  if (!scoredList.length) return undefined; // callers must guard against an empty pool
   const sorted = [...scoredList].sort((a, b) => b.score - a.score);
   const topScore = sorted[0]?.score ?? 0;
   const candidates = sorted
@@ -1013,30 +1014,6 @@ function findOwner(data, team) {
   return null;
 }
 
-async function buildTeamBreakdown(teamNumber, scoreFn) {
-  const teamName = await getTeamName(teamNumber);
-  const score = await scoreFn(teamNumber);
-  return `**FRC ${teamNumber} — ${teamName}**\nTotal: **${score} pts**`;
-}
-
-async function buildFantasyBreakdown(data, scoreFn, player) {
-  const players = player === 'ALL' ? data.players : data.players.filter(p => p === player);
-  const blocks = [];
-
-  for (const p of players) {
-    const teams = data.teamsDrafted[p] || [];
-    const teamParts = await Promise.all(teams.map(async team => {
-      const score = await scoreFn(team);
-      const name = await getTeamName(team);
-      return `- FRC ${team} — ${name}: **${score} pts**`;
-    }));
-    const total = teams.length ? (await Promise.all(teams.map(scoreFn))).reduce((a, b) => a + b, 0) : 0;
-    blocks.push(`**${playerDisplay(p)}**\nTotal: **${total} pts**\n${teamParts.join('\n') || 'No teams drafted yet.'}`);
-  }
-
-  return blocks.join('\n\n');
-}
-
 // ---------------- CPU AUTO-PICK ----------------
 // Called recursively until a human's turn or draft ends
 async function doBotPick(data, channelId, channel, guildId) {
@@ -1473,6 +1450,7 @@ client.on('interactionCreate', async (interaction) => {
       if (theirOwner === userId) return interaction.reply({ content: "❌ You already own that team.", ephemeral: true });
       if (theirOwner === BOT_PLAYER_ID) return interaction.reply({ content: "❌ You can't trade with the CPU.", ephemeral: true });
       if (data.pendingTrade) return interaction.reply({ content: "❌ There's already a pending trade. It must be accepted, declined, or cancelled first.", ephemeral: true });
+      if (data.phase === "worlds_finished") return interaction.reply({ content: "❌ The draft is fully complete — trading is closed.", ephemeral: true });
 
       // Trades are locked after Week 5 (0-indexed week 4) has concluded
       if (guildConfig.lastPostedWeek >= 4) {
@@ -1674,10 +1652,21 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.commandName === 'breakdown') {
       await interaction.deferReply();
-      const target = interaction.options.getString('player').trim();
-      const playerIds = target === 'ALL' ? data.players : data.players.filter(p => p === target);
+      const rawTarget = interaction.options.getString('player').trim();
 
-      if (!playerIds.length) return interaction.editReply("No matching fantasy player found.");
+      let playerIds;
+      if (rawTarget.toUpperCase() === 'ALL') {
+        playerIds = data.players;
+      } else {
+        // Accept a raw id, an @mention, or a manual player's plain name.
+        const mentionMatch = rawTarget.match(/^<@!?(\d+)>$/);
+        const resolvedId = mentionMatch ? mentionMatch[1]
+          : data.players.includes(`MANUAL_${rawTarget}`) ? `MANUAL_${rawTarget}`
+          : rawTarget;
+        playerIds = data.players.filter(p => p === resolvedId);
+      }
+
+      if (!playerIds.length) return interaction.editReply("No matching fantasy player found. Use `ALL`, an @mention, or a manual player's exact name.");
 
       const year = getYear(data);
       const scoreFn = data.phase === "worlds" || data.phase === "worlds_finished" ? t => getTeamWorldsScore(t, year) : t => getTeamSeasonScore(t, year);
@@ -1714,7 +1703,9 @@ client.on('interactionCreate', async (interaction) => {
       data.teamsDrafted[entry.player] = data.teamsDrafted[entry.player].filter(t => t !== entry.team);
       data.pickLog = data.pickLog.filter(p => p.pickIndex !== entry.pickIndex);
       data.currentPick = entry.pickIndex;
-      if (data.phase === "finished") data.phase = data.seasonTeams.length ? "season" : "worlds";
+      // "finished" only ever comes from the season draft completing (doBotPick/pick/skip/
+      // manualpick/auto-skip only set it that way), so reopening it always means "season".
+      if (data.phase === "finished") data.phase = "season";
       if (data.phase === "worlds_finished") data.phase = "worlds";
       saveData(data, channelId);
 
@@ -2079,6 +2070,8 @@ client.on('interactionCreate', async (interaction) => {
                 '`/setchannel` — Set this channel as the draft channel *(admin)*',
                 '`/setyear [year]` — Override the FRC season year *(admin)*',
                 '`/addadmin [@user]` — Promote a player to admin',
+                '`/start_draft` — Start the season draft *(admin)*',
+                '`/start_worlds_draft` — Start the worlds draft once the season draft is finished *(admin)*',
               ].join('\n')
             },
             {
@@ -2091,6 +2084,7 @@ client.on('interactionCreate', async (interaction) => {
                 '`/settimer [minutes]` — Set auto-skip timer; `0` = disabled *(admin)*',
                 '`/undraft [team]` — Undo a pick *(admin)*',
                 '`/reset_draft` — Fully reset the draft *(admin)*',
+                '*CPU auto-picks and auto-skips pick from a pool of similarly-strong available teams, not always the single best one.*',
               ].join('\n')
             },
             {
@@ -2100,12 +2094,12 @@ client.on('interactionCreate', async (interaction) => {
                 '`/myteams` — Your personal team scores *(private)*',
                 '`/schedule` — Upcoming events for all drafted teams',
                 '`/score [team]` — Full point breakdown for any FRC team',
-                '`/breakdown [player]` — Detailed breakdown for a player or ALL',
+                '`/breakdown [player]` — Detailed breakdown for ALL, an @mention, or a manual player\'s name',
                 '`/podium` — Fantasy podium',
               ].join('\n')
             },
             {
-              name: '🔄 Trades *(closes after Week 5)*',
+              name: '🔄 Trades *(closes after Week 5, and once the worlds draft is complete)*',
               value: [
                 '`/trade [offer] [request]` — Propose a team swap',
                 '`/accepttrade` — Accept a pending trade',
