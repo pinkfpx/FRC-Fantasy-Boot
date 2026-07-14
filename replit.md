@@ -27,6 +27,8 @@ All secrets are stored in Replit Secrets:
 - `TBA_KEY` — The Blue Alliance API key (for fetching FRC team data)
 - `CHANNEL_ID` — Discord channel ID
 
+**Status:** Dependencies are installed and the "Start application" workflow runs `node index.js`. The current `TOKEN` value is rejected by Discord (`TokenInvalid`), so the bot cannot log in yet. Get a valid bot token from the Discord Developer Portal (Application → Bot → Reset Token / copy token) and update the `TOKEN` secret, then restart the workflow. After that, run `node commands.js` once to register the slash commands.
+
 ## Slash Commands
 
 | Command | Description |
