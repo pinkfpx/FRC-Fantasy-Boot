@@ -323,11 +323,21 @@ async function getTeamHistoricalSeasonScore(teamNumber, currentYear) {
 }
 
 // Adds a randomness factor to auto-picks: instead of always taking the single
-// highest-scoring team, gather the top `poolSize` teams (a group that's "relatively
-// similar" in strength) and pick randomly among them.
-function pickWithRandomness(scoredList, poolSize = 10) {
+// highest-scoring team, gather a group of teams that are genuinely comparable in
+// strength and pick randomly among them. "Comparable" is relative, not a fixed number —
+// a team has to score within `minRelativeStrength` (80%) of the best available score to
+// even enter the pool, capped at `poolSize` candidates. This matters because a flat
+// top-10-by-count pool can include teams far behind the leader once the score gap widens
+// (e.g. early in a draft with a long tail of weaker teams); a relative floor keeps every
+// candidate close to the best option regardless of how the scores happen to be
+// distributed, and it naturally tightens or loosens as the pool of remaining teams changes
+// through the draft — no hardcoded score threshold to keep in sync with a given season/pool.
+function pickWithRandomness(scoredList, poolSize = 10, minRelativeStrength = 0.8) {
   const sorted = [...scoredList].sort((a, b) => b.score - a.score);
-  const candidates = sorted.slice(0, Math.min(poolSize, sorted.length));
+  const topScore = sorted[0]?.score ?? 0;
+  const candidates = sorted
+    .filter(s => s.score >= topScore * minRelativeStrength)
+    .slice(0, poolSize);
   return candidates[Math.floor(Math.random() * candidates.length)];
 }
 
