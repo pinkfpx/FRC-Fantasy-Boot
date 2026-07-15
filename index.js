@@ -6,7 +6,10 @@ const {
   EmbedBuilder,
   AttachmentBuilder,
   ChannelType,
-  PermissionFlagsBits
+  PermissionFlagsBits,
+  ButtonBuilder,
+  ButtonStyle,
+  ActionRowBuilder
 } = require('discord.js');
 const cron = require('node-cron');
 
@@ -1233,8 +1236,146 @@ client.on('guildCreate', async (guild) => {
   }
 });
 
+// ---------------- HELP MENU (button-driven) ----------------
+// Each category backs both a home-menu button and its own drill-down embed.
+const HELP_CATEGORIES = [
+  {
+    id: 'setup',
+    emoji: '🔧',
+    label: 'Draft Setup',
+    lines: [
+      '`/join_draft` — Join the fantasy draft',
+      '`/addbot` — Add a CPU auto-picker',
+      '`/addmanualplayer [name]` — Add a non-Discord player *(admin)*',
+      '`/draftstatus [open]` — Open or close the draft *(admin)*',
+      '`/setchannel` — Set this channel as the draft channel *(admin)*',
+      '`/setyear [year]` — Override the FRC season year *(admin)*',
+      '`/addadmin [@user]` — Promote a player to admin',
+      '`/start_draft` — Start the season draft *(admin)*',
+      '`/start_worlds_draft` — Start the worlds draft once the season draft is finished *(admin)*',
+    ]
+  },
+  {
+    id: 'during',
+    emoji: '🎯',
+    label: 'During the Draft',
+    lines: [
+      '`/pick [team]` — Pick a team on your turn',
+      '`/manualpick [player] [team]` — Pick for a manual player *(admin)*',
+      '`/skip` — Auto-pick the best available team for your turn',
+      '`/draftorder` — Show the upcoming pick order',
+      '`/settimer [minutes]` — Set auto-skip timer; `0` = disabled *(admin)*',
+      '`/undraft [team]` — Undo a pick *(admin)*',
+      '`/reset_draft` — Fully reset the draft *(admin)*',
+      '*CPU auto-picks and auto-skips pick from a pool of similarly-strong available teams, not always the single best one.*',
+      '*If the pick timer expires, the player is pinged and gets a grace period (10 min, or half the timer if it\'s 25 min or less) before being auto-picked.*',
+    ]
+  },
+  {
+    id: 'season',
+    emoji: '🏆',
+    label: 'Season',
+    lines: [
+      '`/standings` — Live fantasy standings with scores',
+      '`/myteams` — Your personal team scores *(private)*',
+      '`/schedule` — Upcoming events for all drafted teams',
+      '`/score [team]` — Full point breakdown for any FRC team',
+      '`/breakdown [player]` — Detailed breakdown for ALL, an @mention, or a manual player\'s name',
+      '`/podium` — Fantasy podium',
+    ]
+  },
+  {
+    id: 'trades',
+    emoji: '🔄',
+    label: 'Trades',
+    lines: [
+      '*Trades close after Week 5, and 24h after the worlds draft finishes.*',
+      '`/trade [offer] [request]` — Propose a team swap',
+      '`/tradelock [mode]` — Override the trade lock: `auto`, `locked`, or `open` *(admin)*',
+      '`/accepttrade` — Accept a pending trade',
+      '`/declinetrade` — Decline or cancel a trade',
+    ]
+  },
+  {
+    id: 'info',
+    emoji: '🔍',
+    label: 'Teams & Info',
+    lines: [
+      '`/teams` — All fantasy teams and their owners',
+      '`/roster` — Clean roster list (no scores)',
+      '`/team [name]` — Search for a team by name',
+      '`/team_identify [number]` — Look up a team by number',
+      '`/rules` — Show scoring rules',
+      '`/currentyear` — Show the active FRC season year',
+    ]
+  },
+  {
+    id: 'export',
+    emoji: '📤',
+    label: 'Export & Announcements',
+    lines: [
+      '`/exportcsv` — Export draft data as two CSV files',
+      '`/announce [message]` — Post to #frc-fantasy-updates *(admin)*',
+    ]
+  },
+];
+
+function buildHelpHomeEmbed() {
+  return new EmbedBuilder()
+    .setTitle('📖 FRC Fantasy Bot — Command Reference')
+    .setDescription('Pick a category below to see its commands.')
+    .setColor(0x5865F2)
+    .addFields(HELP_CATEGORIES.map(c => ({
+      name: `${c.emoji} ${c.label}`,
+      value: `${c.lines.length} ${c.lines.length === 1 ? 'entry' : 'entries'}`,
+      inline: true
+    })))
+    .setFooter({ text: 'Buttons only work for you — this message is private.' });
+}
+
+function buildHelpHomeComponents() {
+  const rows = [];
+  for (let i = 0; i < HELP_CATEGORIES.length; i += 3) {
+    rows.push(new ActionRowBuilder().addComponents(
+      HELP_CATEGORIES.slice(i, i + 3).map(c =>
+        new ButtonBuilder().setCustomId(`help_${c.id}`).setLabel(c.label).setEmoji(c.emoji).setStyle(ButtonStyle.Primary)
+      )
+    ));
+  }
+  return rows;
+}
+
+function buildHelpCategoryEmbed(cat) {
+  return new EmbedBuilder()
+    .setTitle(`${cat.emoji} ${cat.label}`)
+    .setDescription(cat.lines.join('\n'))
+    .setColor(0x5865F2)
+    .setFooter({ text: 'FRC Fantasy Bot — Command Reference' });
+}
+
+function buildHelpCategoryComponents() {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('help_home').setLabel('Back').setEmoji('◀️').setStyle(ButtonStyle.Secondary)
+  )];
+}
+
 // ---------------- COMMAND HANDLER ----------------
 client.on('interactionCreate', async (interaction) => {
+  // ── /help category buttons ──────────────────────────────────
+  if (interaction.isButton() && interaction.customId.startsWith('help_')) {
+    try {
+      if (interaction.customId === 'help_home') {
+        return await interaction.update({ embeds: [buildHelpHomeEmbed()], components: buildHelpHomeComponents() });
+      }
+      const cat = HELP_CATEGORIES.find(c => c.id === interaction.customId.slice('help_'.length));
+      if (!cat) return await interaction.update({ embeds: [buildHelpHomeEmbed()], components: buildHelpHomeComponents() });
+      return await interaction.update({ embeds: [buildHelpCategoryEmbed(cat)], components: buildHelpCategoryComponents() });
+    } catch (err) {
+      console.error('Help button error:', err);
+    }
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
   if (!interaction.guildId) return interaction.reply({ content: "This bot only works inside a server.", ephemeral: true });
 
@@ -2139,79 +2280,11 @@ client.on('interactionCreate', async (interaction) => {
 
     // ── HELP ──────────────────────────────────────────────────────
     if (interaction.commandName === 'help') {
-      return interaction.reply({ ephemeral: true, embeds: [
-        new EmbedBuilder()
-          .setTitle('📖 FRC Fantasy Bot — Command Reference')
-          .setColor(0x5865F2)
-          .addFields(
-            {
-              name: '🔧 Draft Setup',
-              value: [
-                '`/join_draft` — Join the fantasy draft',
-                '`/addbot` — Add a CPU auto-picker',
-                '`/addmanualplayer [name]` — Add a non-Discord player *(admin)*',
-                '`/draftstatus [open]` — Open or close the draft *(admin)*',
-                '`/setchannel` — Set this channel as the draft channel *(admin)*',
-                '`/setyear [year]` — Override the FRC season year *(admin)*',
-                '`/addadmin [@user]` — Promote a player to admin',
-                '`/start_draft` — Start the season draft *(admin)*',
-                '`/start_worlds_draft` — Start the worlds draft once the season draft is finished *(admin)*',
-              ].join('\n')
-            },
-            {
-              name: '🎯 During the Draft',
-              value: [
-                '`/pick [team]` — Pick a team on your turn',
-                '`/manualpick [player] [team]` — Pick for a manual player *(admin)*',
-                '`/skip` — Auto-pick the best available team for your turn',
-                '`/draftorder` — Show the upcoming pick order',
-                '`/settimer [minutes]` — Set auto-skip timer; `0` = disabled *(admin)*',
-                '`/undraft [team]` — Undo a pick *(admin)*',
-                '`/reset_draft` — Fully reset the draft *(admin)*',
-                '*CPU auto-picks and auto-skips pick from a pool of similarly-strong available teams, not always the single best one.*',
-                '*If the pick timer expires, the player is pinged and gets a grace period (10 min, or half the timer if it\'s 25 min or less) before being auto-picked.*',
-              ].join('\n')
-            },
-            {
-              name: '🏆 Season',
-              value: [
-                '`/standings` — Live fantasy standings with scores',
-                '`/myteams` — Your personal team scores *(private)*',
-                '`/schedule` — Upcoming events for all drafted teams',
-                '`/score [team]` — Full point breakdown for any FRC team',
-                '`/breakdown [player]` — Detailed breakdown for ALL, an @mention, or a manual player\'s name',
-                '`/podium` — Fantasy podium',
-              ].join('\n')
-            },
-            {
-              name: '🔄 Trades *(closes after Week 5, and 24h after the worlds draft finishes)*',
-              value: [
-                '`/trade [offer] [request]` — Propose a team swap',
-                '`/tradelock [mode]` — Override the trade lock: `auto`, `locked`, or `open` *(admin)*',
-                '`/accepttrade` — Accept a pending trade',
-                '`/declinetrade` — Decline or cancel a trade',
-              ].join('\n')
-            },
-            {
-              name: '🔍 Teams & Info',
-              value: [
-                '`/teams` — All fantasy teams and their owners',
-                '`/roster` — Clean roster list (no scores)',
-                '`/team [name]` — Search for a team by name',
-                '`/team_identify [number]` — Look up a team by number',
-                '`/rules` — Show scoring rules',
-                '`/currentyear` — Show the active FRC season year',
-              ].join('\n')
-            },
-            {
-              name: '📤 Export & Announcements',
-              value: [
-                '`/exportcsv` — Export draft data as two CSV files',
-                '`/announce [message]` — Post to #frc-fantasy-updates *(admin)*',
-              ].join('\n')
-            }
-          )
-      ]});
+      return interaction.reply({
+        ephemeral: true,
+        embeds: [buildHelpHomeEmbed()],
+        components: buildHelpHomeComponents()
+      });
     }
 
     // ── RULES ─────────────────────────────────────────────────────
