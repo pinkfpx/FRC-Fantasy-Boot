@@ -23,9 +23,11 @@ node commands.js
 All secrets are stored in Replit Secrets:
 - `TOKEN` — Discord bot token
 - `CLIENT_ID` — Discord application client ID
-- `GUILD_ID` — Discord server (guild) ID
 - `TBA_KEY` — The Blue Alliance API key (for fetching FRC team data)
-- `CHANNEL_ID` — Discord channel ID
+
+The bot is multi-server by design and does not need a hardcoded guild or channel ID — it auto-detects both at runtime:
+- **Guild**: commands are global (registered once via `node commands.js`, no per-guild ID needed at the code level), and every interaction carries its own `guildId` from Discord. On `guildCreate` the bot auto-creates a `#frc-fantasy-updates` announcements channel and saves its ID to `guild_config_<guildId>.json`.
+- **Draft channel**: a server admin picks it by running `/setchannel` in the desired channel; that channel's ID is likewise saved to `guild_config_<guildId>.json`.
 
 **Status:** Dependencies are installed and the "Start application" workflow runs `node index.js`. The current `TOKEN` value is rejected by Discord (`TokenInvalid`), so the bot cannot log in yet. Get a valid bot token from the Discord Developer Portal (Application → Bot → Reset Token / copy token) and update the `TOKEN` secret, then restart the workflow. After that, run `node commands.js` once to register the slash commands.
 
