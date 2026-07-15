@@ -143,16 +143,21 @@ const closedCommands = [
     .addStringOption(opt => opt.setName('message').setDescription('Message to post').setRequired(true).setMaxLength(2000)),
 ];
 
-const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
-
-(async () => {
-  try {
-    console.log('Registering global slash commands...');
-    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: fullCommands });
-    console.log('✅ All commands registered globally! (may take up to 1 hour to appear in servers)');
-  } catch (error) {
-    console.error('Error:', error);
-  }
-})();
+// Only register commands when this file is run directly (`node commands.js`).
+// index.js also `require`s this file for its exported command lists (e.g. to
+// re-register guild commands on /draftstatus) — without this guard, that require
+// would trigger an unwanted global command registration as a side effect.
+if (require.main === module) {
+  const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
+  (async () => {
+    try {
+      console.log('Registering global slash commands...');
+      await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: fullCommands });
+      console.log('✅ All commands registered globally! (may take up to 1 hour to appear in servers)');
+    } catch (error) {
+      console.error('Error:', error);
+    }
+  })();
+}
 
 module.exports = { fullCommands, closedCommands };

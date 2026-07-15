@@ -1817,7 +1817,7 @@ client.on('interactionCreate', async (interaction) => {
         const suffix = (place % 10 === 1 && place !== 11) ? 'st' : (place % 10 === 2 && place !== 12) ? 'nd' : (place % 10 === 3 && place !== 13) ? 'rd' : 'th';
         const viewer = standings[viewerRank];
         desc += `\n👤 **Your placement:** ${place}${suffix} place — **${viewer.totalScore} pts**`;
-      } else if (data.players.includes(BOT_PLAYER_ID) && userId !== BOT_PLAYER_ID) {
+      } else {
         desc += "\n👤 You are not in this draft.";
       }
 
@@ -1953,7 +1953,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'team') {
       await interaction.deferReply();
       const search = interaction.options.getString('name').toLowerCase();
-      const allTeams = await loadSeasonTeams();
+      const allTeams = await loadSeasonTeams(getYear(data));
       const matches = [];
       for (const num of allTeams) {
         const name = await getTeamName(num);
